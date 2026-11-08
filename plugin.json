@@ -1,0 +1,13 @@
+{
+  "id": "stage-studio",
+  "name": "律动 Studio",
+  "version": "1.1.0",
+  "minAppVersion": "0.1.23",
+  "main": "index.js",
+  "stageApi": 1,
+  "stageModes": [
+    { "id": "cinema", "label": "电影字幕" }
+  ],
+  "permissions": {},
+  "navigation": [{ "builtin": "home", "title": "使用说明" }]
+}

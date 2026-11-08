@@ -1,0 +1,6 @@
+build/
+node_modules/
+*.exe
+*.mp3
+*.mp4
+*.ncm

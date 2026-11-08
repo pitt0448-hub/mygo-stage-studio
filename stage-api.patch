@@ -1,0 +1,791 @@
+diff --git a/internal/app/app.go b/internal/app/app.go
+index 5477c23..a5e9800 100644
+--- a/internal/app/app.go
++++ b/internal/app/app.go
+@@ -156,6 +156,7 @@ type app struct {
+ 	quiet                 quietState    // the quiet parts of the song playing, for its top comments
+ 	sig                   playerSig
+ 	quitting              bool
++	stageRuntime          *stageRuntime
+ 
+ 	settings    settings
+ 	settingsWin *mygo.Window
+diff --git a/internal/app/settings.go b/internal/app/settings.go
+index 0cff3e1..b9c2567 100644
+--- a/internal/app/settings.go
++++ b/internal/app/settings.go
+@@ -61,7 +61,9 @@ type settings struct {
+ 	StageStyle string `json:"stageStyle,omitempty"`
+ 	// StageSparks throws sparks off each word on the stage as it is sung,
+ 	// whatever its style.
+-	StageSparks bool `json:"stageSparks,omitempty"`
++	StageSparks bool   `json:"stageSparks,omitempty"`
++	StagePlugin string `json:"stagePlugin,omitempty"`
++	StageMode   string `json:"stageMode,omitempty"`
+ 	// Volume is where the volume was left, from 0 to 1.
+ 	Volume float64 `json:"volume"`
+ 	// Normalize evens out the loudness of tracks, by what their source
+diff --git a/internal/app/stage_movie_test.go b/internal/app/stage_movie_test.go
+new file mode 100644
+index 0000000..e49a2ae
+--- /dev/null
++++ b/internal/app/stage_movie_test.go
+@@ -0,0 +1,51 @@
++package app
++
++import (
++	"encoding/json"
++	"fmt"
++	"github.com/egoist/mygo/ui"
++	"mygo-music/internal/plugin"
++	"os"
++	"testing"
++)
++
++// With explicit offline inputs, renders the real plugin through the live stage's
++// drawing code. No recording, playback, or access to the user's library occurs.
++func TestStageMovie(t *testing.T) {
++	source, inputs := os.Getenv("MYGO_STAGE_PLUGIN_DIR"), os.Getenv("MYGO_STAGE_MOVIE_INPUT")
++	if source == "" || inputs == "" {
++		t.Skip()
++	}
++	dir := framesDir(t)
++	b, err := os.ReadFile(inputs)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var frames []plugin.StageInput
++	if err = json.Unmarshal(b, &frames); err != nil {
++		t.Fatal(err)
++	}
++	p, err := plugin.Load(source, t.TempDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer p.Close()
++	if len(frames) == 0 {
++		t.Fatal("no frames")
++	}
++	var scene *plugin.StageScene
++	tt := ui.NewTester(func(c *ui.Context) {
++		if scene != nil {
++			drawStageScene(c, ui.Box(c).Fill().Clip(), scene, frames[0].Width)
++		}
++	}, int(frames[0].Width), int(frames[0].Height))
++	tt.SetDark(true)
++	for i, in := range frames {
++		scene, err = p.StageFrame(in)
++		if err != nil {
++			t.Fatal(err)
++		}
++		tt.Frame()
++		saveFrame(t, dir, fmt.Sprintf("frame-%04d.png", i), tt.Image())
++	}
++}
+diff --git a/internal/app/stage_plugin_test.go b/internal/app/stage_plugin_test.go
+new file mode 100644
+index 0000000..73aba47
+--- /dev/null
++++ b/internal/app/stage_plugin_test.go
+@@ -0,0 +1,129 @@
++package app
++
++import (
++	"github.com/egoist/mygo/ui"
++	"mygo-music/internal/plugin"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++)
++
++func stageFixture(t *testing.T) *plugin.Plugin {
++	t.Helper()
++	dir := t.TempDir()
++	os.WriteFile(filepath.Join(dir, "plugin.json"), []byte(`{"id":"test-stage","name":"Test Stage","stageApi":1,"stageModes":[{"id":"test","label":"Test"}]}`), 0600)
++	os.WriteFile(filepath.Join(dir, "index.js"), []byte(`export function stageFrame(i) {return {primitives:[{kind:"text",text:i.title,x:i.width/2,y:i.height/2,size:32,weight:600,align:"center",color:[255,255,255,255]}]}}`), 0600)
++	p, err := plugin.Load(dir, t.TempDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(p.Close)
++	return p
++}
++
++// Selecting a renderer changes only the stage, and selecting Flow returns to it.
++func TestStagePluginSelection(t *testing.T) {
++	a, tt, _ := playingApp()
++	a.plugins = []*plugin.Plugin{stageFixture(t)}
++	ch := posts(a)
++	source := a.library
++	a.nowPlaying, a.npPane = true, paneStage
++	tt.Move(600, 400)
++	tt.Advance(time.Second)
++	if err := tt.Click("Stage Style"); err != nil {
++		t.Fatal(err)
++	}
++	if err := tt.ChooseMenuItem("Test Stage · Test"); err != nil {
++		t.Fatal(err)
++	}
++	tt.Frame()
++	if a.settings.StagePlugin != "test-stage" || a.library != source {
++		t.Fatal("renderer changed music source or did not select")
++	}
++	until(t, ch, func() bool {
++		return a.stageRuntime != nil && (a.stageRuntime.scene != nil || a.stageRuntime.err != nil)
++	})
++	tt.Frame()
++	if a.stageRuntime == nil || a.stageRuntime.scene == nil {
++		t.Fatalf("no scene: %+v", a.stageRuntime)
++	}
++	if err := tt.Click("Stage Style"); err != nil {
++		t.Fatal(err)
++	}
++	if err := tt.ChooseMenuItem("Flow"); err != nil {
++		t.Fatal(err)
++	}
++	tt.Frame()
++	if a.settings.StagePlugin != "" || a.stageRuntime != nil {
++		t.Fatal("did not restore built-in stage")
++	}
++}
++
++// Optional native previews execute the real installed plugin at screen sizes,
++// rather than rendering a separate browser imitation of its output.
++func TestStagePluginFrames(t *testing.T) {
++	dir := framesDir(t)
++	source := os.Getenv("MYGO_STAGE_PLUGIN_DIR")
++	if source == "" {
++		t.Skip()
++	}
++	p, err := plugin.Load(source, t.TempDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer p.Close()
++	for _, mode := range []string{"cinema"} {
++		a, _, _ := playingApp()
++		a.plugins = []*plugin.Plugin{p}
++		a.settings.StagePlugin = p.Info().ID
++		a.settings.StageMode = mode
++		a.nowPlaying, a.npPane = true, paneStage
++		a.pl.Seek(12300 * time.Millisecond)
++		ch := posts(a)
++		tt := ui.NewTester(a.view, 1600, 1000)
++		tt.SetDark(true)
++		tt.SetPreferences(ui.Preferences{ReduceMotion: true})
++		tt.Frame()
++		until(t, ch, func() bool { return a.stageRuntime.scene != nil || a.stageRuntime.err != nil })
++		tt.Advance(time.Second)
++		tt.Frame()
++		if a.stageRuntime.busy {
++			until(t, ch, func() bool { return !a.stageRuntime.busy })
++			tt.Frame()
++		}
++		if a.stageRuntime.err != nil {
++			t.Fatal(a.stageRuntime.err)
++		}
++		saveFrame(t, dir, "studio-"+mode+".png", tt.Image())
++	}
++}
++
++// Word runs once reused a sibling's key and dropped trailing spaces, causing
++// panics and joined words; both rows must coexist and preserve a visible gap.
++func TestStageWordRowsKeepSpacing(t *testing.T) {
++	word := func(s string) plugin.StageRun {
++		return plugin.StageRun{Text: s, Scale: 1, Opacity: 1, Color: [4]uint8{255, 255, 255, 255}}
++	}
++	scene := &plugin.StageScene{Primitives: []plugin.StagePrimitive{
++		{Kind: "text", Text: "Heading", X: 20, Y: 10, Size: 14, Weight: 400, Color: [4]uint8{255, 255, 255, 255}},
++		{Kind: "words", X: 20, Y: 60, Size: 40, Weight: 500, Runs: []plugin.StageRun{word("Hello "), word("world")}},
++		{Kind: "words", X: 20, Y: 130, Size: 40, Weight: 500, Runs: []plugin.StageRun{word("Second "), word("row")}},
++	}}
++	tt := ui.NewTester(func(c *ui.Context) { drawStageScene(c, ui.Box(c).Fill(), scene, 800) }, 800, 400)
++	tt.Frame()
++	a, ok := tt.Find("Hello ")
++	if !ok {
++		t.Fatalf("missing first word: %q", tt.Texts())
++	}
++	b, ok := tt.Find("world")
++	if !ok {
++		t.Fatal("missing second word")
++	}
++	if b.X < a.X+a.W+3 {
++		t.Fatalf("words lost their gap: first %+v, second %+v", a, b)
++	}
++	if !tt.HasText("Second ") {
++		t.Fatal("missing second row")
++	}
++}
+diff --git a/internal/app/ui_stage.go b/internal/app/ui_stage.go
+index cec1316..276b67c 100644
+--- a/internal/app/ui_stage.go
++++ b/internal/app/ui_stage.go
+@@ -92,6 +92,9 @@ func spaceWords(shapes []wordShape, widths []float32, gap float32) {
+ 
+ // stage shows the lyrics of tr on the whole stage.
+ func (a *app) stage(c *ui.Context, tr *music.Track, accent ui.Color) {
++	if a.pluginStage(c, tr, accent) {
++		return
++	}
+ 	pl := a.pl
+ 	lines, loaded := pl.Lyrics()
+ 	w, h := c.Size()
+diff --git a/internal/app/ui_stage_plugin.go b/internal/app/ui_stage_plugin.go
+new file mode 100644
+index 0000000..cf9269d
+--- /dev/null
++++ b/internal/app/ui_stage_plugin.go
+@@ -0,0 +1,220 @@
++package app
++
++import (
++	"reflect"
++	"slices"
++	"time"
++
++	"github.com/egoist/mygo/ui"
++	"mygo-music/internal/lyrics"
++	"mygo-music/internal/music"
++	"mygo-music/internal/plugin"
++)
++
++type stageRuntime struct {
++	source *plugin.Plugin
++	mode   string
++	bounds ui.Handle
++	busy   bool
++	last   time.Time
++	input  plugin.StageInput
++	scene  *plugin.StageScene
++	err    error
++}
++
++func (a *app) stagePlugins() []*plugin.Plugin {
++	var out []*plugin.Plugin
++	for _, p := range a.plugins {
++		if p.HasStage() && !slices.Contains(a.settings.DisabledPlugins, p.Info().ID) {
++			out = append(out, p)
++		}
++	}
++	return out
++}
++
++func stageLineInput(l *lyrics.Line) *plugin.StageLine {
++	if l == nil {
++		return nil
++	}
++	out := &plugin.StageLine{Text: l.Text, Translation: l.Translation, Start: l.At.Milliseconds(), End: l.End.Milliseconds()}
++	for _, w := range l.Words {
++		out.Words = append(out.Words, plugin.StageWord{Text: w.Text, Start: w.Start.Milliseconds(), End: w.End.Milliseconds()})
++	}
++	return out
++}
++
++// pluginStage schedules at most one worker per selected renderer. The last
++// completed immutable scene paints while its successor is calculated.
++func (a *app) pluginStage(c *ui.Context, tr *music.Track, accent ui.Color) bool {
++	if a.settings.StagePlugin == "" {
++		a.stageRuntime = nil
++		return false
++	}
++	var selected *plugin.Plugin
++	for _, p := range a.stagePlugins() {
++		if p.Info().ID == a.settings.StagePlugin {
++			selected = p
++			break
++		}
++	}
++	if selected == nil {
++		a.stageRuntime = nil
++		ui.Text(c, T("Stage plugin unavailable; using built-in lyrics.")).FontSize(12).TextColor(white.Alpha(0.6))
++		return false
++	}
++	s := a.stageRuntime
++	if s == nil || s.source != selected || s.mode != a.settings.StageMode {
++		s = &stageRuntime{source: selected, mode: a.settings.StageMode}
++		a.stageRuntime = s
++	}
++	if s.err != nil {
++		ui.Text(c, T("Stage plugin stopped; select it again to retry.")).FontSize(12).TextColor(white.Alpha(0.6)).Tooltip(s.err.Error())
++		return false
++	}
++	r := s.bounds.Bounds(c)
++	w, h := c.Size()
++	if r.W > 0 && r.H > 0 {
++		w, h = r.W, r.H
++	} else {
++		h = max(100, h-180)
++	}
++	pos := a.pl.Position()
++	bands, live := a.pl.Levels()
++	in := plugin.StageInput{APIVersion: 1, Width: w, Height: h, Position: pos.Milliseconds(), Playing: a.pl.Playing(), ReduceMotion: c.Preferences().ReduceMotion, TrackID: tr.Source + ":" + tr.ID, Title: tr.Name, Mode: s.mode, Accent: [3]uint8{accent.R, accent.G, accent.B}, Bands: append([]float32(nil), bands[:]...), HasSpectrum: live}
++	lines, _ := a.pl.Lyrics()
++	cur := lyrics.Index(lines, pos)
++	if cur >= 0 {
++		in.Current = stageLineInput(&lines[cur])
++	}
++	if cur > 0 {
++		in.Previous = stageLineInput(&lines[cur-1])
++	}
++	if cur+1 < len(lines) {
++		in.Next = stageLineInput(&lines[cur+1])
++	}
++	now := c.Now()
++	changed := !reflect.DeepEqual(in, s.input)
++	if !s.busy && changed && (s.last.IsZero() || now.Sub(s.last) >= time.Second/30) {
++		s.busy = true
++		s.last = now
++		s.input = in
++		// The snapshot owns its slices. No UI context or element leaves this thread.
++		go func() {
++			scene, err := selected.StageFrame(in)
++			a.post(func() {
++				if a.stageRuntime != s || a.quitting {
++					return
++				}
++				s.busy = false
++				s.scene = scene
++				s.err = err
++			})
++		}()
++	}
++	if in.Playing || changed && !s.busy {
++		c.After(time.Second / 30)
++	}
++	box := ui.Box(c.Key("plugin-stage")).Grow(1).Bind(&s.bounds).Clip().PassThrough()
++	a.npRise(box, 1)
++	if s.scene == nil {
++		box.Children(func() { ui.Text(c, T("Loading stage plugin…")).FontSize(16).TextColor(white.Alpha(0.5)) })
++		return true
++	}
++	scene := s.scene
++	drawStageScene(c, box, scene, w)
++	return true
++}
++
++// drawStageScene is shared by the live stage and native offline previews.
++func drawStageScene(c *ui.Context, box ui.Element, scene *plugin.StageScene, w float32) {
++	bg := scene.Background
++	box.Background(ui.RGB(bg[0], bg[1], bg[2]).Alpha(float32(bg[3]) / 255))
++	box.Draw(func(p *ui.Painter, r ui.Rect) {
++		for _, n := range scene.Primitives {
++			color := ui.RGB(n.Color[0], n.Color[1], n.Color[2]).Alpha(float32(n.Color[3]) / 255)
++			switch n.Kind {
++			case "circle":
++				p.FillPath((&ui.Path{}).Circle(r.X+n.X, r.Y+n.Y, n.Radius), color)
++			case "ring":
++				p.StrokePath((&ui.Path{}).Circle(r.X+n.X, r.Y+n.Y, n.Radius), n.Width, color)
++			case "line":
++				p.StrokePath((&ui.Path{}).MoveTo(r.X+n.X, r.Y+n.Y).LineTo(r.X+n.X2, r.Y+n.Y2), n.Width, color)
++			case "path":
++				path := &ui.Path{}
++				for i, pt := range n.Points {
++					if i == 0 {
++						path.MoveTo(r.X+pt.X, r.Y+pt.Y)
++					} else {
++						path.LineTo(r.X+pt.X, r.Y+pt.Y)
++					}
++				}
++				if len(n.Points) > 1 {
++					p.StrokePath(path, n.Width, color)
++				}
++			}
++		}
++	}).Children(func() {
++		for i, n := range scene.Primitives {
++			if n.Kind == "words" {
++				drawStageWords(c, n, w, i)
++				continue
++			}
++			if n.Kind != "text" {
++				continue
++			}
++			size := float32(int(n.Size + 0.5)) // bounded glyph-cache sizes while words swell
++			tw, _ := c.MeasureText(0, ui.Span{Text: n.Text, Size: size, Weight: n.Weight})
++			if tw > w-32 {
++				size = max(1, size*(w-32)/tw)
++				tw = w - 32
++			}
++			x := n.X
++			if n.Align == "center" {
++				x -= tw / 2
++			} else if n.Align == "right" {
++				x -= tw
++			}
++			ui.Text(c.Key(i), n.Text).Absolute().Left(max(0, x)).Top(n.Y).FontSize(size).FontWeight(n.Weight).NoWrap().
++				TextColor(ui.RGB(n.Color[0], n.Color[1], n.Color[2]).Alpha(float32(n.Color[3]) / 255))
++		}
++	})
++}
++
++// Native measurements preserve real word spacing while the plugin choreographs
++// each word. The cell stays put; its glyphs use the final animated font size.
++func drawStageWords(c *ui.Context, n plugin.StagePrimitive, w float32, row int) {
++	size := n.Size
++	widths := make([]float32, len(n.Runs))
++	total := float32(0)
++	marker, _ := c.MeasureText(0, ui.Span{Text: "|", Size: size, Weight: n.Weight})
++	for i, run := range n.Runs {
++		// Text measurements omit trailing spaces; a visible sentinel retains
++		// them so separate words do not run together.
++		widths[i], _ = c.MeasureText(0, ui.Span{Text: run.Text + "|", Size: size, Weight: n.Weight})
++		widths[i] -= marker
++		total += widths[i]
++	}
++	avail := max(32, w-2*n.X)
++	if n.Align == "center" {
++		avail = w * 0.84
++	}
++	if total > avail {
++		k := avail / total
++		size *= k
++		total = avail
++		for i := range widths {
++			widths[i] *= k
++		}
++	}
++	x := n.X
++	if n.Align == "center" {
++		x -= total / 2
++	}
++	for i, run := range n.Runs {
++		fs := float32(int(size*run.Scale + 0.5))
++		col := run.Color
++		ui.Text(c.Key([2]int{row, i}), run.Text).Absolute().Left(x).Top(n.Y + run.Rise).
++			FontSize(max(1, fs)).FontWeight(n.Weight).NoWrap().TextColor(ui.RGB(col[0], col[1], col[2]).Alpha(float32(col[3]) / 255 * run.Opacity))
++		x += widths[i]
++	}
++}
+diff --git a/internal/app/ui_stage_styles.go b/internal/app/ui_stage_styles.go
+index 6595708..537c8d0 100644
+--- a/internal/app/ui_stage_styles.go
++++ b/internal/app/ui_stage_styles.go
+@@ -27,8 +27,13 @@ var stageStyles = []struct{ id, label string }{
+ // others.
+ func (a *app) stageStyleButton(c *ui.Context) {
+ 	label := stageStyles[0].label
++	for _, p := range a.stagePlugins() {
++		if p.Info().ID == a.settings.StagePlugin {
++			label = p.Info().Name
++		}
++	}
+ 	for _, s := range stageStyles {
+-		if s.id == a.settings.StageStyle {
++		if s.id == a.settings.StageStyle && a.settings.StagePlugin == "" {
+ 			label = s.label
+ 		}
+ 	}
+@@ -45,12 +50,24 @@ func (a *app) stageStyleButton(c *ui.Context) {
+ 	})
+ 	b.Menu(func(m *ui.Menu) {
+ 		for _, s := range stageStyles {
+-			if m.Item(T(s.label)).Checked(a.settings.StageStyle == s.id).Chosen() && a.settings.StageStyle != s.id {
++			if m.Item(T(s.label)).Checked(a.settings.StagePlugin == "" && a.settings.StageStyle == s.id).Chosen() {
++				a.settings.StagePlugin = ""
++				a.stageRuntime = nil
+ 				a.settings.StageStyle = s.id
+ 				a.settings.save()
+ 			}
+ 		}
+ 		m.Separator()
++		for _, p := range a.stagePlugins() {
++			for _, mode := range p.StageModes() {
++				if m.Item(p.Info().Name + " · " + mode.Label).Checked(a.settings.StagePlugin == p.Info().ID && a.settings.StageMode == mode.ID).Chosen() {
++					a.settings.StagePlugin, a.settings.StageMode = p.Info().ID, mode.ID
++					a.stageRuntime = nil
++					a.settings.save()
++				}
++			}
++		}
++		m.Separator()
+ 		if m.Item(T("Sparks")).Checked(a.settings.StageSparks).Chosen() {
+ 			a.settings.StageSparks = !a.settings.StageSparks
+ 			a.settings.save()
+diff --git a/internal/i18n/zh_cn.go b/internal/i18n/zh_cn.go
+index 95cf5b9..b757818 100644
+--- a/internal/i18n/zh_cn.go
++++ b/internal/i18n/zh_cn.go
+@@ -314,6 +314,9 @@ var zhCN = map[string]string{
+ 	"Songs you like will show here":                                                     "喜欢的歌曲会显示在这里",
+ 	"Sparks":                                                                            "火花",
+ 	"Stage":                                                                             "律动",
++	"Loading stage plugin…":                                                             "正在加载律动插件…",
++	"Stage plugin unavailable; using built-in lyrics.":                                  "律动插件不可用，已恢复内置效果。",
++	"Stage plugin stopped; select it again to retry.":                                   "律动插件已停止，重新选择可重试。",
+ 	"Stage Style":                                                                       "律动效果",
+ 	"Standard":                                                                          "标准",
+ 	"Start Listening":                                                                   "开始收听",
+diff --git a/internal/plugin/plugin.go b/internal/plugin/plugin.go
+index d4fffc0..2ca5407 100644
+--- a/internal/plugin/plugin.go
++++ b/internal/plugin/plugin.go
+@@ -125,7 +125,9 @@ func (ps Programs) Allows(dir, command string) bool {
+ // Manifest is a plugin's plugin.json.
+ type Manifest struct {
+ 	music.Info
+-	Main string `json:"main,omitempty"`
++	StageAPI   int         `json:"stageApi,omitempty"`
++	StageModes []StageMode `json:"stageModes,omitempty"`
++	Main       string      `json:"main,omitempty"`
+ 	// MinAppVersion is the oldest version of the app the plugin works with,
+ 	// such as 0.1.8. An older one won't install it, or load it.
+ 	MinAppVersion  string           `json:"minAppVersion,omitempty"`
+diff --git a/internal/plugin/stage.go b/internal/plugin/stage.go
+new file mode 100644
+index 0000000..e1eaf62
+--- /dev/null
++++ b/internal/plugin/stage.go
+@@ -0,0 +1,149 @@
++package plugin
++
++import (
++	"fmt"
++	"math"
++	"time"
++)
++
++// Stage API 1 is an opt-in drawing source, separate from a music source.
++// Coordinates are logical pixels; text is rasterized at its final font size.
++type StageMode struct {
++	ID    string `json:"id"`
++	Label string `json:"label"`
++}
++type StageWord struct {
++	Text  string `json:"text"`
++	Start int64  `json:"start"`
++	End   int64  `json:"end"`
++}
++type StageLine struct {
++	Text        string      `json:"text"`
++	Translation string      `json:"translation"`
++	Start       int64       `json:"start"`
++	End         int64       `json:"end"`
++	Words       []StageWord `json:"words"`
++}
++type StageInput struct {
++	APIVersion   int        `json:"apiVersion"`
++	Width        float32    `json:"width"`
++	Height       float32    `json:"height"`
++	Position     int64      `json:"position"`
++	Playing      bool       `json:"playing"`
++	ReduceMotion bool       `json:"reduceMotion"`
++	TrackID      string     `json:"trackId"`
++	Title        string     `json:"title"`
++	Mode         string     `json:"mode"`
++	Accent       [3]uint8   `json:"accent"`
++	Bands        []float32  `json:"bands"`
++	HasSpectrum  bool       `json:"hasSpectrum"`
++	Current      *StageLine `json:"current"`
++	Previous     *StageLine `json:"previous"`
++	Next         *StageLine `json:"next"`
++}
++type StagePoint struct {
++	X float32 `json:"x"`
++	Y float32 `json:"y"`
++}
++type StagePrimitive struct {
++	Kind   string       `json:"kind"`
++	X      float32      `json:"x"`
++	Y      float32      `json:"y"`
++	X2     float32      `json:"x2"`
++	Y2     float32      `json:"y2"`
++	Radius float32      `json:"radius"`
++	Width  float32      `json:"width"`
++	Text   string       `json:"text"`
++	Size   float32      `json:"size"`
++	Weight int          `json:"weight"`
++	Align  string       `json:"align"`
++	Color  [4]uint8     `json:"color"`
++	Points []StagePoint `json:"points,omitempty"`
++	Runs   []StageRun   `json:"runs,omitempty"`
++}
++
++type StageRun struct {
++	Text    string   `json:"text"`
++	Scale   float32  `json:"scale"`
++	Opacity float32  `json:"opacity"`
++	Rise    float32  `json:"rise"`
++	Color   [4]uint8 `json:"color"`
++}
++type StageScene struct {
++	Background [4]uint8         `json:"background"`
++	Primitives []StagePrimitive `json:"primitives"`
++}
++
++func (p *Plugin) HasStage() bool          { return p.manifest.StageAPI == 1 && p.Can("stageFrame") }
++func (p *Plugin) StageModes() []StageMode { return append([]StageMode(nil), p.manifest.StageModes...) }
++
++// StageFrame runs off the UI thread, with one outstanding call per stage.
++func (p *Plugin) StageFrame(in StageInput) (*StageScene, error) {
++	if !p.HasStage() {
++		return nil, fmt.Errorf("unsupported stage API")
++	}
++	var scene StageScene
++	if err := p.callWithin(250*time.Millisecond, "stageFrame", in, &scene); err != nil {
++		return nil, err
++	}
++	if err := scene.Validate(); err != nil {
++		return nil, err
++	}
++	return &scene, nil
++}
++
++// Validate bounds drawing work and rejects non-finite geometry before it
++// reaches the renderer. Unknown commands fail visibly instead of being ignored.
++func (s *StageScene) Validate() error {
++	if len(s.Primitives) > 384 {
++		return fmt.Errorf("stage exceeds 384 primitives")
++	}
++	points, text, runs := 0, 0, 0
++	for _, n := range s.Primitives {
++		switch n.Kind {
++		case "text", "words", "circle", "ring", "line", "path":
++		default:
++			return fmt.Errorf("unknown stage primitive %q", n.Kind)
++		}
++		for _, v := range []float32{n.X, n.Y, n.X2, n.Y2, n.Radius, n.Width, n.Size} {
++			if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) || v < -32768 || v > 32768 {
++				return fmt.Errorf("invalid stage geometry")
++			}
++		}
++		if n.Radius < 0 || n.Radius > 8192 || n.Width < 0 || n.Width > 128 || n.Size < 0 || n.Size > 320 {
++			return fmt.Errorf("stage size out of range")
++		}
++		if (n.Kind == "text" || n.Kind == "words") && (n.Size < 1 || n.Weight < 100 || n.Weight > 900) {
++			return fmt.Errorf("invalid stage text style")
++		}
++		text += len(n.Text)
++		runs += len(n.Runs)
++		if runs > 384 {
++			return fmt.Errorf("stage total word budget exceeded")
++		}
++		if len(n.Runs) > 160 {
++			return fmt.Errorf("stage word budget exceeded")
++		}
++		for _, run := range n.Runs {
++			text += len(run.Text)
++			for _, v := range []float32{run.Scale, run.Opacity, run.Rise} {
++				if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
++					return fmt.Errorf("invalid stage word")
++				}
++			}
++			if run.Scale < 0.5 || run.Scale > 2 || run.Opacity < 0 || run.Opacity > 1 || math.Abs(float64(run.Rise)) > 500 {
++				return fmt.Errorf("stage word out of range")
++			}
++		}
++		points += len(n.Points)
++		if text > 16384 || points > 4096 {
++			return fmt.Errorf("stage drawing budget exceeded")
++		}
++		for _, v := range n.Points {
++			if math.IsNaN(float64(v.X)) || math.IsNaN(float64(v.Y)) || math.IsInf(float64(v.X), 0) || math.IsInf(float64(v.Y), 0) || math.Abs(float64(v.X)) > 32768 || math.Abs(float64(v.Y)) > 32768 {
++				return fmt.Errorf("invalid stage path")
++			}
++		}
++	}
++	return nil
++}
+diff --git a/internal/plugin/stage_test.go b/internal/plugin/stage_test.go
+new file mode 100644
+index 0000000..1cfe50d
+--- /dev/null
++++ b/internal/plugin/stage_test.go
+@@ -0,0 +1,42 @@
++package plugin
++
++import (
++	"math"
++	"testing"
++)
++
++// A stage receives the current song's timing and returns validated drawing data.
++func TestStageProtocol(t *testing.T) {
++	p := load(t, `{"id":"stage","stageApi":1}`, `export function stageFrame(v) { return {primitives:[{kind:"text",text:v.trackId+":"+v.position,x:20,y:40,size:32,weight:600,color:[255,255,255,255]}]}; }`)
++	scene, err := p.StageFrame(StageInput{APIVersion: 1, TrackID: "source:track", Position: 1234})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if scene.Primitives[0].Text != "source:track:1234" {
++		t.Fatal(scene)
++	}
++}
++
++// Invalid commands and unbounded geometry never enter the native renderer.
++func TestStageRejectsInvalidDrawing(t *testing.T) {
++	for _, s := range []StageScene{
++		{Primitives: make([]StagePrimitive, 385)},
++		{Primitives: []StagePrimitive{{Kind: "script"}}},
++		{Primitives: []StagePrimitive{{Kind: "circle", Radius: -1}}},
++		{Primitives: []StagePrimitive{{Kind: "line", X: float32(math.NaN())}}},
++		{Primitives: []StagePrimitive{{Kind: "text", Size: 999, Weight: 600}}},
++		{Primitives: []StagePrimitive{{Kind: "path", Points: make([]StagePoint, 4097)}}},
++	} {
++		if s.Validate() == nil {
++			t.Fatalf("accepted invalid scene: %+v", s)
++		}
++	}
++}
++
++// A stage that never resolves times out rather than occupying its worker forever.
++func TestStagePendingPromiseTimesOut(t *testing.T) {
++	p := load(t, `{"id":"stage","stageApi":1}`, `export function stageFrame() { return new Promise(()=>{}); }`)
++	if _, err := p.StageFrame(StageInput{}); err == nil {
++		t.Fatal("expected timeout")
++	}
++}
+diff --git a/mygo.config.ts b/mygo.config.ts
+index ea61113..a43fa7e 100644
+--- a/mygo.config.ts
++++ b/mygo.config.ts
+@@ -1,26 +1,24 @@
+-// The configuration of the app, which `mygo dev` and `mygo build` evaluate with
+-// Bun, of the command running. The development app (`mygo dev`) opens links of a
+-// scheme of its own, for the installed app to keep mygo-music:// links.
+-export default ({ command }: { command: string }) => ({
+-  name: "MyGo Music",
+-  identifier: "dev.egoist.music",
+-  slug: "mygo-music",
+-  version: "0.1.22",
+-  out: "build",
+-  urlSchemes: [command === "dev" ? "mygo-music-dev" : "mygo-music"],
+-  updates: {
+-    publicKey: "WzJsOGNIuf6mcEqo5ff8jub+NoQQOEk4JXreLPYjgyQ=",
+-    github: "egoist/mygo-music",
+-  },
+-  macos: {
+-    icon: "icon/AppIcon.icon",
+-    minimumSystemVersion: "13.0",
+-    signingIdentity: "Developer ID Application: xinyu zeng (GJE9R5VE87)",
+-    notarize: { keychainProfile: "notary" },
+-  },
+-  linux: {
+-    comment: "A music player for your files and more",
+-    categories: ["AudioVideo", "Audio", "Player"],
+-    webview: false,
+-  },
+-});
++// The configuration of the app, which `mygo dev` and `mygo build` evaluate with
++// Bun, of the command running. The development app (`mygo dev`) opens links of a
++// scheme of its own, for the installed app to keep mygo-music:// links.
++export default ({ command }: { command: string }) => ({
++  name: "MyGo Music",
++  identifier: "dev.egoist.music",
++  slug: "mygo-music",
++  version: "0.1.23",
++  out: "build",
++  urlSchemes: [command === "dev" ? "mygo-music-dev" : "mygo-music"],
++  // This custom Stage API build must not replace itself with an upstream build
++  // that does not implement the API. Update it from its own project instead.
++  macos: {
++    icon: "icon/AppIcon.icon",
++    minimumSystemVersion: "13.0",
++    signingIdentity: "Developer ID Application: xinyu zeng (GJE9R5VE87)",
++    notarize: { keychainProfile: "notary" },
++  },
++  linux: {
++    comment: "A music player for your files and more",
++    categories: ["AudioVideo", "Audio", "Player"],
++    webview: false,
++  },
++});
